@@ -24,6 +24,8 @@ use minimq::{
 };
 use tcp_stack::NetworkStack;
 
+use core::fmt::Write;
+
 pub struct NetStorage {
     ip_addrs: [net::wire::IpCidr; 1],
     neighbor_cache: [Option<(net::wire::IpAddress, net::iface::Neighbor)>; 8],
@@ -85,14 +87,21 @@ fn init_log() {
     init_log(logger).unwrap();
 }
 
+pub struct HeartbeatSettings {
+    rate: u32,
+    status: u8
+}
+
 #[rtic::app(device = stm32h7xx_hal::stm32, peripherals = true, monotonic = rtic::cyccnt::CYCCNT)]
 const APP: () = {
     struct Resources {
         net_interface: NetworkInterface,
         rng: stm32h7xx_hal::rng::Rng,
+        usart3_tx: stm32h7xx_hal::serial::Tx<stm32h7xx_hal::stm32::USART3>,
+        heartbeat_settings: HeartbeatSettings,
     }
 
-    #[init]
+    #[init(schedule=[usart3])]
     fn init(mut c: init::Context) -> init::LateResources {
         c.core.DWT.enable_cycle_counter();
 
@@ -116,6 +125,7 @@ const APP: () = {
         let gpioa = c.device.GPIOA.split(ccdr.peripheral.GPIOA);
         let gpiob = c.device.GPIOB.split(ccdr.peripheral.GPIOB);
         let gpioc = c.device.GPIOC.split(ccdr.peripheral.GPIOC);
+        let gpiod = c.device.GPIOD.split(ccdr.peripheral.GPIOD);
         let gpiog = c.device.GPIOG.split(ccdr.peripheral.GPIOG);
 
         // Configure ethernet IO
@@ -164,11 +174,29 @@ const APP: () = {
         // Initialize random number generator
         let rng = c.device.RNG.constrain(ccdr.peripheral.RNG, &ccdr.clocks);
 
+        // Initialize UART 3
+        let usart3 = c.device.USART3.serial(
+            (gpiod.pd8.into_alternate_af7(), gpiod.pd9.into_alternate_af7()),
+            115200.bps(),
+            ccdr.peripheral.USART3,
+            &ccdr.clocks
+           ).unwrap();
+        let (u3tx, _) = usart3.split();
+
+        let heartbeat = HeartbeatSettings {
+            rate: 1,
+            status: 0,
+        };
+
+        c.schedule.usart3(c.start + (400_000_000u32 / heartbeat.rate).cycles());
+
         c.core.SCB.enable_icache();
 
         init::LateResources {
             net_interface: net_interface,
             rng: rng,
+            usart3_tx: u3tx,
+            heartbeat_settings: heartbeat,
         }
     }
 
@@ -191,7 +219,15 @@ const APP: () = {
         )
         .unwrap();
 
+	let mut subscribed = false;
+
         loop {
+
+            if client.is_connected().unwrap() && !subscribed {
+                client.subscribe("settings", &[]).unwrap();
+                info!("subscribed to topic!");
+                subscribed = true;
+            }
             let tick = Instant::now() > next_ms;
 
             if tick {
@@ -222,7 +258,7 @@ const APP: () = {
 
             match client
                 .poll(|_client, topic, message, _properties| match topic {
-                    _ => info!("On '{:?}', received: {:?}", topic, message),
+                    _ => info!("On '{:?}', received: {:?}", topic, core::str::from_utf8(message)),
                 })
             {
                 Ok(_) => {},
@@ -245,8 +281,20 @@ const APP: () = {
         }
     }
 
+    #[task(resources=[usart3_tx, heartbeat_settings], schedule=[usart3])]
+    fn usart3(cx: usart3::Context) {
+        writeln!(cx.resources.usart3_tx, "status: {}", cx.resources.heartbeat_settings.status);
+
+        let rate = cx.resources.heartbeat_settings.rate;
+        cx.schedule.usart3(Instant::now() + (400_000_000u32 / rate).cycles());
+    }
+
     #[task(binds=ETH)]
     fn eth(_: eth::Context) {
         unsafe { ethernet::interrupt_handler() }
+    }
+
+    extern "C" {
+        fn USART3();
     }
 };
