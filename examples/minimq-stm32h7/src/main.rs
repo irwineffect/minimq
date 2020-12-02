@@ -87,9 +87,26 @@ fn init_log() {
     init_log(logger).unwrap();
 }
 
+#[derive(Debug, Copy, Clone)]
 pub struct HeartbeatSettings {
     rate: u32,
     status: u8
+}
+
+impl HeartbeatSettings {
+    fn string_set(&mut self, field: &str, value: &str) -> Result<(),()> {
+        match field {
+            "rate" => {
+                self.rate = value.parse().map_err(|_|{()})?;
+                Ok(())
+            }
+            "status" => {
+                self.status = value.parse().map_err(|_|{()})?;
+                Ok(())
+            }
+            _ => Err(())
+        }
+    }
 }
 
 #[rtic::app(device = stm32h7xx_hal::stm32, peripherals = true, monotonic = rtic::cyccnt::CYCCNT)]
@@ -99,6 +116,7 @@ const APP: () = {
         rng: stm32h7xx_hal::rng::Rng,
         usart3_tx: stm32h7xx_hal::serial::Tx<stm32h7xx_hal::stm32::USART3>,
         heartbeat_settings: HeartbeatSettings,
+        heartbeat_counter: u8,
     }
 
     #[init(schedule=[usart3])]
@@ -197,13 +215,17 @@ const APP: () = {
             rng: rng,
             usart3_tx: u3tx,
             heartbeat_settings: heartbeat,
+            heartbeat_counter: 0,
         }
     }
 
-    #[idle(resources=[net_interface, rng])]
-    fn idle(c: idle::Context) -> ! {
+    #[idle(resources=[net_interface, rng, heartbeat_settings])]
+    fn idle(mut c: idle::Context) -> ! {
         let mut time: u32 = 0;
         let mut next_ms = Instant::now();
+
+        // Initialize staging settings to current settings values
+        let mut staging_settings = c.resources.heartbeat_settings.lock(|s| {*s});
 
         next_ms += 400_00.cycles();
 
@@ -211,7 +233,9 @@ const APP: () = {
         let mut sockets = net::socket::SocketSet::new(&mut socket_set_entries[..]);
         add_socket!(sockets, rx_storage, tx_storage);
 
-        let tcp_stack = NetworkStack::new(c.resources.net_interface, sockets);
+        let net_interface = c.resources.net_interface;
+        let tcp_stack = NetworkStack::new(net_interface, sockets);
+        let mut heartbeat_settings = c.resources.heartbeat_settings;
         let mut client = MqttClient::<consts::U256, _>::new(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             "nucleo",
@@ -224,7 +248,8 @@ const APP: () = {
         loop {
 
             if client.is_connected().unwrap() && !subscribed {
-                client.subscribe("settings", &[]).unwrap();
+                client.subscribe("settings/#", &[]).unwrap();
+                client.subscribe("commit", &[]).unwrap();
                 info!("subscribed to topic!");
                 subscribed = true;
             }
@@ -256,9 +281,29 @@ const APP: () = {
                     .unwrap();
             }
 
+
             match client
-                .poll(|_client, topic, message, _properties| match topic {
-                    _ => info!("On '{:?}', received: {:?}", topic, core::str::from_utf8(message)),
+                .poll(|_client, topic, message, _properties| match topic.split('/').nth(0).unwrap() {
+                    "settings" => {
+                        let message = core::str::from_utf8(message).unwrap();
+                        let subtopic = topic.split('/').skip(1).nth(0).unwrap();
+                        info!("subtopic: {:#?}", subtopic);
+                        let update_result = staging_settings.string_set(subtopic, message);
+                        info!("settings update: '{:?}', received: {:?}, result: {:?}", topic, message, update_result);
+                        info!("staged settings: {:#?}", staging_settings);
+
+                    }
+                    "commit" => {
+                        info!("commiting settings");
+                        // Commit the settings to the real structure
+                        heartbeat_settings.lock(|s| {
+                            *s = staging_settings;
+                        });
+                    }
+                    _ => {
+                        let message = core::str::from_utf8(message).unwrap();
+                        info!("On '{:?}', received: {:?}", topic, message)
+                    }
                 })
             {
                 Ok(_) => {},
@@ -281,9 +326,13 @@ const APP: () = {
         }
     }
 
-    #[task(resources=[usart3_tx, heartbeat_settings], schedule=[usart3])]
+    #[task(resources=[usart3_tx, heartbeat_settings, heartbeat_counter], schedule=[usart3])]
     fn usart3(cx: usart3::Context) {
-        writeln!(cx.resources.usart3_tx, "status: {}", cx.resources.heartbeat_settings.status);
+        writeln!(cx.resources.usart3_tx, "{} status: {}",
+            cx.resources.heartbeat_counter,
+            cx.resources.heartbeat_settings.status);
+
+        *cx.resources.heartbeat_counter = cx.resources.heartbeat_counter.wrapping_add(1);
 
         let rate = cx.resources.heartbeat_settings.rate;
         cx.schedule.usart3(Instant::now() + (400_000_000u32 / rate).cycles());
