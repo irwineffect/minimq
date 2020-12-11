@@ -13,6 +13,7 @@ use cortex_m;
 
 use panic_halt as _;
 use serde::{Deserialize, Serialize};
+use serde_json_core;
 
 use rtic::cyccnt::{Instant, U32Ext};
 
@@ -87,24 +88,124 @@ fn init_log() {
     init_log(logger).unwrap();
 }
 
-#[derive(Debug, Copy, Clone)]
+
+// Global settings data structure, holds all other settings
+#[derive(Debug, Copy, Clone, Default)]
+pub struct Settings {
+    heartbeat: HeartbeatSettings,
+}
+
+impl Settings {
+    fn string_set(&mut self, mut topic_parts: core::iter::Peekable<core::str::Split<char>>, value: &str) -> Result<(),()> {
+        let field = topic_parts.next().ok_or(())?;
+        let next = topic_parts.peek();
+
+        // If there is more parts in the topic data , the field must either a
+        // struct or an array
+        if let Some(_next) = next {
+            match field {
+                "heartbeat" => {
+                    self.heartbeat.string_set(topic_parts, value)
+                }
+                _ => Err(())
+            }
+        }
+        // Else, we are at the end of the topic list, must be a field of this
+        // struct
+        else {
+            match field {
+                "heartbeat" => {
+                    self.heartbeat = serde_json_core::from_str(value).map_err(|_|{()})?;
+                    Ok(())
+                }
+                _ => Err(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, Default, Deserialize)]
 pub struct HeartbeatSettings {
     rate: u32,
-    status: u8
+    status: u8,
+    j1: ExampleJunk1,
 }
 
 impl HeartbeatSettings {
-    fn string_set(&mut self, field: &str, value: &str) -> Result<(),()> {
-        match field {
-            "rate" => {
-                self.rate = value.parse().map_err(|_|{()})?;
-                Ok(())
+    fn string_set(&mut self, mut topic_parts: core::iter::Peekable<core::str::Split<char>>, value: &str) -> Result<(),()> {
+        let field = topic_parts.next().ok_or(())?;
+        let next = topic_parts.peek();
+
+        // If there is more parts in the topic data , the field must either a
+        // struct or an array
+        if let Some(_next) = next {
+            match field {
+                "j1" => {
+                    self.j1.string_set(topic_parts, value)
+                }
+                _ => Err(())
             }
-            "status" => {
-                self.status = value.parse().map_err(|_|{()})?;
-                Ok(())
+        }
+        // Else, we are at the end of the topic list, must be a field of this
+        // struct
+        else {
+            match field {
+                "rate" => {
+                    self.rate = value.parse().map_err(|_|{()})?;
+                    Ok(())
+                }
+                "status" => {
+                    self.status = value.parse().map_err(|_|{()})?;
+                    Ok(())
+                }
+                "j1" => {
+                    self.j1 = serde_json_core::from_str(value).map_err(|_|{()})?;
+                    Ok(())
+                }
+
+                _ => Err(())
             }
-            _ => Err(())
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, Default, Deserialize)]
+pub struct ExampleJunk1 {
+    a: u32,
+    b: [u8;3],
+}
+
+impl ExampleJunk1 {
+    fn string_set(&mut self, mut topic_parts: core::iter::Peekable<core::str::Split<char>>, value: &str) -> Result<(),()> {
+        let field = topic_parts.next().ok_or(())?;
+        let next = topic_parts.peek();
+
+        // If there is more parts in the topic data , the field must either a
+        // struct or an array
+        if let Some(_next) = next {
+            match field {
+                "b" => {
+                    let i: usize = _next.parse().map_err(|_| ())?;
+                    self.b[i] = serde_json_core::from_str(value).map_err(|_|{()})?;
+                    Ok(())
+                }
+                _ => Err(())
+            }
+        }
+        // Else, we are at the end of the topic list, must be a field of this
+        // struct
+        else {
+            match field {
+                "a" => {
+                    self.a = value.parse().map_err(|_|{()})?;
+                    Ok(())
+                }
+                "b" => {
+                    self.b = serde_json_core::from_str(value).map_err(|_|{()})?;
+                    Ok(())
+                }
+                _ => Err(())
+            }
         }
     }
 }
@@ -202,11 +303,11 @@ const APP: () = {
         let (u3tx, _) = usart3.split();
 
         let heartbeat = HeartbeatSettings {
-            rate: 1,
-            status: 0,
+            rate: 1, // initialize the rate to 1
+            ..Default::default() // other settings can be default
         };
 
-        c.schedule.usart3(c.start + (400_000_000u32 / heartbeat.rate).cycles());
+        c.schedule.usart3(c.start + (400_000_000u32 / heartbeat.rate).cycles()).ok();
 
         c.core.SCB.enable_icache();
 
@@ -224,8 +325,10 @@ const APP: () = {
         let mut time: u32 = 0;
         let mut next_ms = Instant::now();
 
-        // Initialize staging settings to current settings values
-        let mut staging_settings = c.resources.heartbeat_settings.lock(|s| {*s});
+        // Initialize staging settings
+        let mut staging_settings = Settings::default();
+        // Update struct with current settings values
+        staging_settings.heartbeat = c.resources.heartbeat_settings.lock(|s| *s);
 
         next_ms += 400_00.cycles();
 
@@ -283,28 +386,30 @@ const APP: () = {
 
 
             match client
-                .poll(|_client, topic, message, _properties| match topic.split('/').nth(0).unwrap() {
-                    "settings" => {
-                        let message = core::str::from_utf8(message).unwrap();
-                        let subtopic = topic.split('/').skip(1).nth(0).unwrap();
-                        info!("subtopic: {:#?}", subtopic);
-                        let update_result = staging_settings.string_set(subtopic, message);
-                        info!("settings update: '{:?}', received: {:?}, result: {:?}", topic, message, update_result);
-                        info!("staged settings: {:#?}", staging_settings);
+                .poll(|_client, topic, message, _properties| {
+                    let mut topic_parts = topic.split('/').peekable();
+                    match topic_parts.next().unwrap() {
+                        "settings" => {
+                            let message = core::str::from_utf8(message).unwrap();
+                            let update_result = staging_settings.string_set(topic_parts,
+                                message);
+                            info!("settings update: '{:?}', received: {:?}, result: {:?}", topic, message, update_result);
+                            info!("staged settings: {:#?}", staging_settings);
 
-                    }
-                    "commit" => {
-                        info!("commiting settings");
-                        // Commit the settings to the real structure
-                        heartbeat_settings.lock(|s| {
-                            *s = staging_settings;
-                        });
-                    }
-                    _ => {
-                        let message = core::str::from_utf8(message).unwrap();
-                        info!("On '{:?}', received: {:?}", topic, message)
-                    }
-                })
+                        }
+                        "commit" => {
+                            info!("commiting settings");
+                            // Commit the settings to the real structures
+                            heartbeat_settings.lock(|s| {
+                                *s = staging_settings.heartbeat;
+                            });
+                        }
+                        _ => {
+                            let message = core::str::from_utf8(message).unwrap();
+                            info!("On '{:?}', received: {:?}", topic, message)
+                        }
+                }})
+
             {
                 Ok(_) => {},
                 // If we got disconnected from the broker
@@ -328,14 +433,16 @@ const APP: () = {
 
     #[task(resources=[usart3_tx, heartbeat_settings, heartbeat_counter], schedule=[usart3])]
     fn usart3(cx: usart3::Context) {
-        writeln!(cx.resources.usart3_tx, "{} status: {}",
+        writeln!(cx.resources.usart3_tx, "{} status: {}, {:#?}",
             cx.resources.heartbeat_counter,
-            cx.resources.heartbeat_settings.status);
+            cx.resources.heartbeat_settings.status,
+            cx.resources.heartbeat_settings.j1,
+            ).unwrap();
 
         *cx.resources.heartbeat_counter = cx.resources.heartbeat_counter.wrapping_add(1);
 
         let rate = cx.resources.heartbeat_settings.rate;
-        cx.schedule.usart3(Instant::now() + (400_000_000u32 / rate).cycles());
+        cx.schedule.usart3(Instant::now() + (400_000_000u32 / rate).cycles()).ok();
     }
 
     #[task(binds=ETH)]
